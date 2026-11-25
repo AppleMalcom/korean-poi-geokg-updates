@@ -1,129 +1,98 @@
-# 국가관심지점정보 기반 공간지식그래프의 증분 갱신과 전체 재구축 성능 비교
+# Batch·증분 갱신 및 실험 코드 안내
 
-- 이 저장소는 대한공간정보학회 2026 추계학술대회에서 발표한 「국가관심지점정보 기반 공간지식그래프의 증분 갱신과 전체 재구축 성능 비교」 논문의 공개 코드입니다.
-- 본 연구는 국토교통부/국토교통과학기술진흥원의 지원으로 수행되었습니다(과제번호 RS-2022-00143336).
-- 작성자: 서울대학교 건설환경도시공학부 공간정보센터 이창현 전임연구원 ([malcom@snu.ac.kr](mailto:malcom@snu.ac.kr))
+이 문서는 학술대회에서 사용한 처리 흐름과 실험 실행 방식을 설명합니다. DB 설치나 초기 그래프 구축을 안내하는 문서는 아닙니다.
 
-두 시점의 국가관심지점정보(국가 POI)를 PostgreSQL/PostGIS에서 비교하여 증분 데이터를 추출하고, 이를 기존 Neo4j 공간지식그래프에 반영하는 파이프라인이다. 전체 재구축(Batch Rebuild)과 증분 갱신(Incremental Update)의 처리 시간 및 논리적 쓰기 연산량을 비교한다.
+## 1. Batch Rebuild
 
-준비된 연구 DB를 전제로 한 구현이며, 원천 데이터와 DB 설치 및 초기 구축 과정은 공개 범위에 포함하지 않는다.
+`batch_ops.py`는 기존 POI 제거와 전체 적재 Cypher를 제공합니다. `execution.rebuild()`는 다음 흐름을 측정합니다.
 
-## 1. 사용한 데이터
+1. 기존 POI·POITombstone을 트랜잭션 단위로 제거.
+2. PostgreSQL에서 대상 범위의 T2 POI를 nf_id 순서로 조회.
+3. Python에서 속성을 변환하여 POI 노드와 WGS-84 point 적재.
+4. adm_cd가 일치하는 행정동에 IN 관계 연결.
 
-### 1.1 T1: 국가관심지점정보
+`rebuild_upsert_batch()`는 T1 복원에도 재사용합니다. 행정구역 노드와 BELONG_TO 계층은 삭제하거나 재구축하지 않습니다.
 
-- 시점: 2024년 11월
-- 출처: [브이월드](https://www.vworld.kr/v4po_main.do)
+## 2. Incremental Update
 
-### 1.2 T2: 국가관심지점정보
+### 변경 탐지: change_detection.py
 
-- 시점: 2026년 1월
-- 출처: [국토정보플랫폼](https://map.ngii.go.kr/mn/mainPage.do)
+T1·T2를 nf_id로 FULL JOIN하여 Appear·Updated·Disappear·No Change를 판정합니다. 명칭·분류코드·행정동은 `IS DISTINCT FROM`, 위치는 `NOT ST_DWithin(t1.geom, t2.geom, 1.0)`으로 비교합니다. 발표 입력은 EPSG:5179이며 geometry 결측이 없는 데이터입니다.
 
-### 1.3 행정구역 경계
+신규·수정은 T2 전체 행, 미관측은 T1 전체 행을 증분 테이블 `mart.benchmark_inc_poi`에 저장합니다. No Change는 저장하지 않습니다. 같은 증분 테이블을 공유하므로 여러 실험 프로세스를 동시에 실행하는 용도는 아닙니다.
 
-- 자료: 2025년 센서스 행정구역 경계
-- 구분: 전국 시도·시군구·행정동
-- 출처: [브이월드](https://www.vworld.kr/v4po_main.do)
+### 증분 반영: incremental_ops.py
 
-실험 범위는 서울특별시이다. 두 시점의 POI에 동일한 행정구역 경계를 적용하고, 공간 포함관계를 이용하여 각 POI의 소속 행정동을 사전 계산한다.
+`execution.apply_delta()`는 Disappear → Appear → Updated 순서로 반영합니다.
 
-위치 비교에는 EPSG:5179를 사용한다. Neo4j에는 EPSG:4326으로 변환한 좌표를 `point` 형식으로 저장한다.
+- Disappear: 현재 IN 관계 제거 → POI 라벨 제거 → POITombstone 라벨 및 관측 시점 속성 설정. 노드의 기존 속성과 마지막 위치는 보존.
+- Appear·Updated: POI MERGE → T2 속성·좌표 반영 → 기존 IN 제거 → 현재 행정동으로 IN 연결.
+- No Change: 기존 T1 상태 유지.
 
-## 2. 증분 갱신 원리
+신규·수정 반영에서 세 Cypher 문은 동일 트랜잭션 안에서 수행합니다. 미관측은 물리적 삭제가 아니며, tombstone의 관측 시점은 이 연구의 T1='2024', T2='2026'에 고정돼 있습니다. 다중 시점 운영을 위한 범용 이력 관리기는 아닙니다.
 
-### 2.1 변화 탐지
+## 3. 실험 1: 서울 전체
 
-두 시점의 POI를 `nf_id` 기준으로 비교한다. 감시 속성(watched properties)은 다음과 같다.
+`experiment_1.py`는 공통 실행기에 아래 조건을 전달하는 얇은 진입점입니다.
 
-| 감시 속성 | 필드 | 변경 기준 |
-| --- | --- | --- |
-| 명칭 | `poi_nm` | 값의 차이 |
-| 분류코드 | `poi_cl_dc` | 값의 차이 |
-| 소속 행정동 | `adm_cd` | 값의 차이 |
-| 위치 | `geom` | 이동 거리 1m 초과 |
+- `--all-seoul --experiment1-three --batch-size 1000`
+- 서울 전체를 하나의 범위로 처리.
+- 사전 워밍업은 별도 파일로 분리. 본측정은 Incremental → Batch를 3쌍 실행.
+- 각 실행 전에 대상 범위의 T1을 재구성하고 기준 ID를 확인.
 
-위치 변경 기준인 1m는 미세한 위치 차이를 갱신 대상에서 제외하기 위한 운영적 허용오차이다. 보편적인 최적 임계값을 의미하지 않는다.
+발표 실행 방식의 참고 명령입니다. 기본 실행도 준비된 PostgreSQL 연결이 필요합니다.
 
-비교 결과에 따라 객체를 네 가지 유형으로 분류한다.
+```powershell
+# 건수만 확인: Neo4j 갱신 없음
+python experiment_1.py
 
-| 유형 | 판정 조건 |
-| --- | --- |
-| Appear | T1에 없고 T2에 존재하는 ID |
-| Updated | 양 시점에 존재하며 감시 속성의 변경 기준에 해당하는 ID |
-| Disappear | T1에 존재하고 T2에 없는 ID |
-| No Change | 변경 기준에 해당하지 않는 ID |
+# 별도 워밍업: 각 방식 1회. 파일 안 role은 measure이므로 본측정과 파일로 분리
+python benchmark_runner.py --all-seoul --pilot --batch-size 1000 --output results/experiment_1/new_warmup.csv --apply --confirm-destructive-benchmark
 
-### 2.2 그래프 반영
-
-공간지식그래프는 다음과 같은 계층으로 구성한다.
-
-```text
-POI ──IN──▶ 행정동 ──BELONG_TO──▶ 시군구 ──BELONG_TO──▶ 시도
+# 본측정: 각 방식 3회, 워밍업 제외
+python experiment_1.py --output results/experiment_1/new_measurements.csv --apply --confirm-destructive-benchmark
 ```
 
-기존 행정구역 계층을 유지하면서 POI 노드와 행정동 사이의 `IN` 관계를 갱신한다.
+## 4. 실험 2: 서울 25개 자치구
 
-| 유형 | 갱신 동작 |
-| --- | --- |
-| Appear | POI 노드를 생성하고 소속 행정동과 IN 관계를 연결한다. |
-| Updated | 기존 POI의 속성과 위치를 갱신하고 IN 관계를 재연결한다. |
-| Disappear | IN 관계를 제거하고 POI를 POITombstone으로 전환한다. |
-| No Change | 기존 T1 상태를 유지한다. |
+`experiment_2.py`는 `--experiment2 --skip-warmup --batch-size 5000`을 전달합니다.
 
-Disappear 객체는 물리적으로 삭제하지 않는다. 마지막 속성과 위치를 보존하고, 마지막 관측 시점과 최초 미관측 시점을 기록한다.
+- 별도 사전 실행으로 구별·방식별 워밍업 1회 수행.
+- 본측정은 25개 구 × 2개 방식 × 3회 = 150회.
+- 한 구의 본측정 6회를 마친 뒤 다음 구로 이동.
+- 구별 첫 방식을 교대: A구 Inc → Batch × 3쌍, B구 Batch → Inc × 3쌍.
+- 구별 방식 평균·표본 표준편차·시간 절감률을 요약 CSV로 기록.
+- 구 경계를 넘는 공통 ID는 구별로 Appear·Disappear로, 서울 전체에서는 Updated로 분류될 수 있음.
 
-반면 Batch Rebuild는 기존 POI를 제거한 후 T2 전체를 다시 적재한다.
+```powershell
+# 건수만 확인
+python experiment_2.py
 
-### 2.3 해석 범위
+# 별도 워밍업: 25개 구 각각 Batch 1회 + Incremental 1회
+python benchmark_runner.py --pilot --batch-size 5000 --output results/experiment_2/new_warmup_5000.csv --apply --confirm-destructive-benchmark
 
-Appear와 Disappear는 **`nf_id` 기준 신규 관측·미관측**이다. 실제 시설의 개업·폐업을 의미하지 않는다. 동일 시설이 서로 다른 ID로 제공되면 Appear와 Disappear로 분리될 수 있으며, 본 구현에서는 시점 간 동일 시설을 판별하는 Entity Resolution을 수행하지 않는다.
+# 본측정 150회만 실행
+python experiment_2.py --output results/experiment_2/new_measurements_5000.csv --apply --confirm-destructive-benchmark
+```
 
-또한 증분 갱신은 No Change 객체의 T1 상태를 유지하므로, 모든 속성과 좌표가 T2와 완전히 동일함을 보장하는 방식은 아니다.
+공통 실행기는 `--experiment2` 단독일 경우 내장 워밍업을 포함합니다. 발표 조건용 `experiment_2.py`는 별도 워밍업 후의 본측정이므로 이를 건너뜁니다. CSV position은 공통 실행기의 3~8번을 사용합니다.
 
-## 3. 코드 설명
+`--resume`은 검증을 통과한 (지역, position)을 건너뜁니다. CSV에 트랜잭션 크기·DB 환경 등이 저장되지 않으므로, 동일한 입력·설정·범위·순서를 사용하는 경우에만 참고할 수 있습니다. 파일 이름만으로 설정 일치를 검증하지는 않습니다.
 
-### 3.1 Batch 및 증분 갱신
+## 5. 실행·측정·검증의 관계
 
-| 파일 | 역할 |
-| --- | --- |
-| [`benchmark/batch_ops.py`](benchmark/batch_ops.py) | Batch 방식의 POI 제거·전체 적재와 공통 속성 변환을 담당한다. |
-| [`benchmark/change_detection.py`](benchmark/change_detection.py) | 두 스냅샷을 비교하고 변경 유형별 증분 데이터를 추출한다. |
-| [`benchmark/incremental_ops.py`](benchmark/incremental_ops.py) | 신규·수정 객체 반영과 미관측 객체의 tombstone 전환을 담당한다. |
+```text
+공통 전처리와 행정구역 계층 구성 (실험 전에 완료)
+    ↓
+대상 범위의 T1 복원·기준 검증 (측정 제외)
+    ↓
+Batch: POI 제거 → T2 전체 적재
+또는
+Incremental: CDC·증분 테이블 생성 → 변경 유형별 반영
+    ↓
+정합성 검증·CSV 저장 (측정 제외)
+```
 
-### 3.2 실행 및 검증
+`--apply --confirm-destructive-benchmark`를 지정하면 **모든 POI·POITombstone을 삭제한 뒤 T1을 복원**합니다. 자치구 실험도 다른 구의 POI를 보존하는 방식이 아닙니다. PostgreSQL의 mart.poi는 읽지만, 증분 테이블은 생성·비우기·삽입합니다.
 
-| 파일 | 역할 |
-| --- | --- |
-| [`benchmark/execution.py`](benchmark/execution.py) | T1 복원, 데이터 전달, 트랜잭션 분할 및 시간 측정을 담당한다. |
-| [`benchmark/validation.py`](benchmark/validation.py) | 활성 ID, 감시 속성, 좌표 갱신 정책, IN 관계 및 tombstone을 검증한다. |
-| [`benchmark_runner.py`](benchmark_runner.py) | 반복 실행, 측정, 검증 및 결과 저장을 제어하는 공통 실행기이다. |
-
-### 3.3 실험 1·2
-
-| 항목 | 실험 1 | 실험 2 |
-| --- | --- | --- |
-| 진입점 | [`experiment_1.py`](experiment_1.py) | [`experiment_2.py`](experiment_2.py) |
-| 범위 | 서울특별시 전체 | 서울시 25개 자치구 |
-| 목적 | Batch와 Incremental의 갱신 성능 비교 | 자치구별 변경률과 시간 절감률의 관계 분석 |
-| 트랜잭션 크기 | 최대 1,000 POI | 최대 5,000 POI |
-| 본측정 | 방식별 3회 | 자치구별·방식별 3회 |
-
-워밍업은 본측정과 분리하여 수행한다. 각 회차는 대상 범위의 T1을 복원한 상태에서 시작하며, 이전 회차의 갱신 결과를 누적하지 않는다.
-
-시간 측정 범위는 다음과 같다.
-
-- **Batch:** 기존 POI 삭제 및 T2 전체 조회·변환·적재
-- **Incremental:** 변경 탐지 및 증분 테이블 생성, 증분 조회·변환·반영
-- **공통 제외:** 원천 데이터 전처리, T1 복원 및 사후 정합성 검증
-
-쓰기 연산량은 Neo4j의 논리적 연산 카운터를 사용한다. 물리적 디스크 I/O나 저장공간 사용량을 의미하지 않는다.
-
-세부 실행 흐름은 [`benchmark/README.md`](benchmark/README.md), 측정 및 검증 정의는 [`docs/experiment_design.md`](docs/experiment_design.md)에 정리한다.
-
-## 별첨: 코드 확인 및 실행 안내
-
-- 본 코드는 발표에서 사용한 연구 구현을 확인하기 위한 참고 자료입니다.
-- 연결 설정 형식은 [`.env.example`](.env.example), Python 의존성은 [`requirements.txt`](requirements.txt)를 참고해 주세요.
-- `--apply` 없이 실행하면 PostgreSQL에서 대상 데이터의 건수만 확인합니다.
-- 쓰기 실행 시에는 매 회차 Neo4j의 모든 `POI`·`POITombstone`을 제거하고 대상 범위의 T1을 복원하므로, 전용 실험 DB에서만 실행해 주세요.
+측정 경계와 정합성의 정확한 정의는 [실험 설계](../docs/experiment_design.md)를 참조하세요. CSV의 논리적 쓰기량은 Neo4j counters이며 디스크 I/O 바이트가 아닙니다. 입력 데이터와 원시 결과 파일은 공개 범위에 포함하지 않습니다.
