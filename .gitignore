@@ -1,0 +1,30 @@
+# 공개 범위를 명시한 허용 목록. 로컬 연구 자료는 삭제하지 않고 Git에서 제외한다.
+/*
+!/.gitignore
+!/README.md
+!/.env.example
+!/requirements.txt
+!/benchmark_runner.py
+!/experiment_1.py
+!/experiment_2.py
+!/benchmark/
+/benchmark/*
+!/benchmark/__init__.py
+!/benchmark/batch_ops.py
+!/benchmark/incremental_ops.py
+!/benchmark/change_detection.py
+!/benchmark/execution.py
+!/benchmark/validation.py
+!/benchmark/README.md
+!/docs/
+/docs/*
+!/docs/experiment_design.md
+
+# 허용 디렉터리 안에서도 개인 설정·캐시·데이터는 제외한다.
+**/.env
+**/.env.*
+!/.env.example
+**/__pycache__/
+**/*.py[cod]
+**/*.dump
+**/*.csv
